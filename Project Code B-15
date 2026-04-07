@@ -1,0 +1,180 @@
+import serial
+import cv2
+import time
+import asyncio
+import nest_asyncio
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ContextTypes
+
+# Allow asyncio inside IDLE
+nest_asyncio.apply()
+
+# ---------------- SERIAL ----------------
+SERIAL_PORT = 'COM6'
+BAUD_RATE = 9600
+
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+time.sleep(2)
+
+# ---------------- TELEGRAM ----------------
+BOT_TOKEN = "8307814221:AAGPw40m3eQKhn07aB4BCth9E0OAwsFq8eA"
+CHAT_ID = "1767639104"
+
+# ---------------- SETTINGS ----------------
+THRESHOLD_DISTANCE = 50
+VALID_MIN = 2
+VALID_MAX = 400
+SAMPLES = 5
+CONFIRM_COUNT = 1
+
+camera_opened = False
+system_armed = False
+below_threshold_counter = 0
+
+# ---------- SEND PHOTO ----------
+async def send_photo_with_accept(app, image_path):
+    keyboard = [[
+        InlineKeyboardButton("✅ Accept", callback_data='ACCEPT'),
+        InlineKeyboardButton("❌ Decline", callback_data='DECLINE')
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        with open(image_path, 'rb') as img:
+            await app.bot.send_photo(
+                chat_id=CHAT_ID,
+                photo=img,
+                caption="🚨 Person detected!",
+                reply_markup=reply_markup
+            )
+    except Exception as e:
+        print("Telegram send error:", e)
+
+# ---------- BUTTON HANDLER ----------
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    try:
+        await query.answer()
+
+        if query.data == 'ACCEPT':
+            print("Motor ON command sent")
+            ser.write(b'MOTOR_ON\n')
+
+            if query.message.caption != "✅ Motor turned ON!":
+                await query.edit_message_caption(
+                    caption="✅ Motor turned ON!",
+                    reply_markup=None
+                )
+
+        elif query.data == 'DECLINE':
+            print("Access Declined")
+
+            if query.message.caption != "❌ Access Declined":
+                await query.edit_message_caption(
+                    caption="❌ Access Declined",
+                    reply_markup=None
+                )
+
+    except Exception as e:
+        print("Telegram button error:", e)
+
+# ---------- SENSOR LOOP ----------
+async def sensor_loop(app):
+    global camera_opened, system_armed, below_threshold_counter
+
+    while True:
+        try:
+            if ser.in_waiting > 0:
+
+                readings = []
+                while len(readings) < SAMPLES:
+                    try:
+                        d = float(ser.readline().decode().strip())
+                        if VALID_MIN <= d <= VALID_MAX:
+                            readings.append(d)
+                    except:
+                        pass
+
+                if not readings:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                distance = sum(readings) / len(readings)
+                print(f"Distance: {distance:.1f} cm")
+
+                # ARM SYSTEM
+                if distance >= THRESHOLD_DISTANCE:
+                    system_armed = True
+                    camera_opened = False
+                    below_threshold_counter = 0
+
+                # DETECT ENTRY
+                if system_armed and distance < THRESHOLD_DISTANCE:
+                    below_threshold_counter += 1
+                else:
+                    below_threshold_counter = 0
+
+                # TRIGGER CAMERA
+                if below_threshold_counter >= CONFIRM_COUNT and not camera_opened:
+                    print("Person detected!")
+                    camera_opened = True
+                    system_armed = False
+                    below_threshold_counter = 0
+
+                    cap = cv2.VideoCapture(0)
+                    time.sleep(2)
+
+                    start_time = time.time()
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+
+                        cv2.imshow("Camera", frame)
+
+                        if time.time() - start_time >= 3:
+                            image_path = "capture.jpg"
+                            cv2.imwrite(image_path, frame)
+                            print("Image captured")
+
+                            await send_photo_with_accept(app, image_path)
+
+                            ser.write(b'ALERT\n')
+                            print("Alert sent to Arduino")
+                            break
+
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            break
+
+                    cap.release()
+                    cv2.destroyAllWindows()
+
+            await asyncio.sleep(0.1)
+
+        except Exception as e:
+            print("Sensor loop error:", e)
+
+# ---------- MAIN ----------
+async def main():
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .build()
+    )
+
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    asyncio.create_task(sensor_loop(app))
+
+    print("System started...")
+    await app.run_polling()
+
+# ---------- RUN IN IDLE ----------
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.create_task(main())
+    loop.run_forever()
